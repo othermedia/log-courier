@@ -156,25 +156,15 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 				if value, ok := eventData[colName]; ok {
 					mappedEvent[colName] = p.formatValue(colName, value)
 				} else {
-					// Check for nested fields like host.name
-					if value := p.resolveNestedField(eventData, colName); value != nil {
-						mappedEvent[colName] = p.formatValue(colName, value)
-					} else {
-						mappedEvent[colName] = nil
-					}
+					mappedEvent[colName] = nil
 				}
 			}
 
 			// Collect unmapped fields into rest JSON column
 			for key, value := range eventData {
-				if !p.isColumnMapped(key) {
-					// Handle metadata fields
-					if key == "@metadata" {
-						// Include metadata in rest JSON
-						restData[key] = value
-					} else if key != "@timestamp" {
-						restData[key] = value
-					}
+				if !p.isColumnMapped(key) && key != "@timestamp" {
+					// Include all unmapped fields, including metadata
+					restData[key] = value
 				}
 			}
 
@@ -244,13 +234,6 @@ func (p *streamLoadRequest) formatValue(colName string, value interface{}) inter
 
 	// For other types, return as-is
 	return value
-}
-
-// resolveNestedField resolves nested field paths like "host.name"
-func (p *streamLoadRequest) resolveNestedField(data map[string]interface{}, path string) interface{} {
-	// Simple nested field resolution for common patterns
-	// This doesn't use full path resolution to keep it simple
-	return nil
 }
 
 // isColumnMapped checks if a field is mapped to a column
