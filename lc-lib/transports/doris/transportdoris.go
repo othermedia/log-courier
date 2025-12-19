@@ -154,7 +154,7 @@ func (t *transportDoris) ensureTableExists(addr *addresspool.Address) error {
 		"tags":                   "ARRAY<STRING>",
 		t.config.RestJSONColumn:  "JSON",
 	}
-	
+
 	// Add additional columns from configuration
 	for colName, colType := range t.config.additionalColumnDefs {
 		t.columnDefs[colName] = colType
@@ -266,15 +266,8 @@ func (t *transportDoris) createTable(addr *addresspool.Address) error {
 		}
 	}
 
-	// Build partition definition based on configuration
-	var partitionClause string
-	if t.config.PartitionDays == 1 {
-		// Daily partitions
-		partitionClause = "PARTITION BY RANGE(`@timestamp`) () "
-	} else {
-		// Multi-day partitions
-		partitionClause = fmt.Sprintf("PARTITION BY RANGE(`@timestamp`) () ")
-	}
+	// Build partition definition
+	partitionClause := "PARTITION BY RANGE(`@timestamp`) () "
 
 	// Build properties including replication and partition retention
 	properties := []string{
@@ -346,18 +339,18 @@ func (t *transportDoris) httpRoutine(id int) {
 
 			request := newStreamLoadRequest(t.columnDefs, t.config.RestJSONColumn, payload.events)
 			eventCount := uint32(len(payload.events))
-			
+
 			// Retry until successful or shutdown
 			for {
 				// Pool Next() is not race-safe
 				t.poolMutex.Lock()
 				addr, err := t.poolEntry.Next()
 				t.poolMutex.Unlock()
-				
+
 				if err == nil {
 					err = t.performStreamLoad(addr, id, request)
 				}
-				
+
 				if err == nil {
 					// Success - acknowledge all events (Doris stream load is all-or-nothing)
 					select {
@@ -368,7 +361,7 @@ func (t *transportDoris) httpRoutine(id int) {
 					}
 					break
 				}
-				
+
 				// Log error and retry
 				log.Errorf("[T %s]{%d} Doris stream load failed: %s", addr.Desc(), id, err)
 				

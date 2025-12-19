@@ -65,7 +65,7 @@ type TransportDorisFactory struct {
 	LoadProperties        map[string]string `config:"load properties"`
 	PartitionDays         int               `config:"partition days"`
 	PartitionRetentionDays int              `config:"partition retention days"`
-	
+
 	// Internal - parsed column definitions
 	additionalColumnDefs map[string]string
 
