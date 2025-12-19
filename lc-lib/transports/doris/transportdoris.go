@@ -188,14 +188,23 @@ func (t *transportDoris) ensureTableExists(addr *addresspool.Address) error {
 // validateAndUpdateColumns validates existing columns and adds missing ones
 func (t *transportDoris) validateAndUpdateColumns(addr *addresspool.Address, describeResult []byte) error {
 	// Parse DESCRIBE result to get existing columns
-	// This is a simplified parse - in production you'd want more robust parsing
+	// DESCRIBE returns tab-separated output with column details
 	existingCols := make(map[string]string)
 	lines := strings.Split(string(describeResult), "\n")
 	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Split by whitespace and extract column name and type
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
 			colName := strings.Trim(fields[0], "`")
 			colType := fields[1]
+			// Handle array types which may be split
+			if len(fields) > 2 && (colType == "ARRAY" || strings.HasPrefix(colType, "ARRAY")) {
+				colType = strings.Join(fields[1:3], "")
+			}
 			existingCols[colName] = colType
 		}
 	}

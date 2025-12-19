@@ -106,12 +106,14 @@ func (f *TransportDorisFactory) Validate(p *config.Parser, configPath string) (e
 		return fmt.Errorf("%srest json column is required", configPath)
 	}
 
-	if f.PartitionDays < 1 {
-		return fmt.Errorf("%spartition days cannot be less than 1", configPath)
-	}
-
 	if f.PartitionRetentionDays < 1 {
 		return fmt.Errorf("%spartition retention days cannot be less than 1", configPath)
+	}
+	
+	// Note: PartitionDays is reserved for future use to support multi-day partitions
+	// Currently only daily partitions are supported
+	if f.PartitionDays != 1 {
+		return fmt.Errorf("%spartition days must be 1 (only daily partitions are currently supported)", configPath)
 	}
 
 	// Parse additional columns and their types
