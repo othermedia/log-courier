@@ -17,7 +17,6 @@
 package doris
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -69,7 +68,7 @@ type transportDoris struct {
 	payloadMutex sync.Mutex
 	poolMutex    sync.Mutex
 	wait         sync.WaitGroup
-	columnNames  []string
+	columnDefs   map[string]string // column name -> type mapping
 }
 
 // Factory returns the associated factory
@@ -145,26 +144,25 @@ func (t *transportDoris) setupAssociation() bool {
 
 // ensureTableExists checks if the table exists and creates it with necessary columns
 func (t *transportDoris) ensureTableExists(addr *addresspool.Address) error {
-	// Define the column names we'll use
-	// These are common fields from log-courier events
-	if len(t.config.Columns) > 0 {
-		t.columnNames = t.config.Columns
-	} else {
-		// Default columns based on common event fields
-		t.columnNames = []string{
-			"@timestamp",
-			"message",
-			"host",
-			"path",
-			"type",
-			"tags",
-			t.config.RestJSONColumn,
-		}
+	// Initialize column definitions with hard-coded defaults
+	t.columnDefs = map[string]string{
+		"@timestamp":             "DATETIME",
+		"message":                "STRING",
+		"host":                   "STRING",
+		"path":                   "STRING",
+		"type":                   "STRING",
+		"tags":                   "ARRAY<STRING>",
+		t.config.RestJSONColumn:  "JSON",
+	}
+	
+	// Add additional columns from configuration
+	for colName, colType := range t.config.additionalColumnDefs {
+		t.columnDefs[colName] = colType
 	}
 
-	// Check if table exists by attempting a SELECT
-	checkSQL := fmt.Sprintf("SELECT 1 FROM `%s`.`%s` LIMIT 1", t.config.Database, t.config.Table)
-	httpRequest, err := t.createRequest(t.ctx, "POST", addr, "/api/query/default_cluster/"+t.config.Database, strings.NewReader(checkSQL))
+	// Check if table exists using DESCRIBE
+	describeSQL := fmt.Sprintf("DESCRIBE `%s`.`%s`", t.config.Database, t.config.Table)
+	httpRequest, err := t.createRequest(t.ctx, "POST", addr, "/api/query/default_cluster/"+t.config.Database, strings.NewReader(describeSQL))
 	if err != nil {
 		return err
 	}
@@ -175,63 +173,154 @@ func (t *transportDoris) ensureTableExists(addr *addresspool.Address) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		bufio.NewReader(httpResponse.Body).WriteTo(io.Discard)
-		httpResponse.Body.Close()
-	}()
+	body, _ := io.ReadAll(httpResponse.Body)
+	httpResponse.Body.Close()
 
-	// If table exists, we're done
 	if httpResponse.StatusCode == 200 {
-		log.Infof("[T %s] Doris table %s.%s exists", addr.Desc(), t.config.Database, t.config.Table)
-		return nil
+		// Table exists - check columns
+		return t.validateAndUpdateColumns(addr, body)
 	}
 
 	// Table doesn't exist - create it
-	// Note: In production, table should be pre-created with proper schema
-	// This is a basic creation for convenience
-	var columnDefs []string
-	for _, col := range t.columnNames {
-		if col == "@timestamp" {
-			columnDefs = append(columnDefs, fmt.Sprintf("`%s` DATETIME", col))
-		} else if col == t.config.RestJSONColumn {
-			columnDefs = append(columnDefs, fmt.Sprintf("`%s` JSON", col))
-		} else if col == "tags" {
-			columnDefs = append(columnDefs, fmt.Sprintf("`%s` ARRAY<STRING>", col))
-		} else {
-			columnDefs = append(columnDefs, fmt.Sprintf("`%s` STRING", col))
+	return t.createTable(addr)
+}
+
+// validateAndUpdateColumns validates existing columns and adds missing ones
+func (t *transportDoris) validateAndUpdateColumns(addr *addresspool.Address, describeResult []byte) error {
+	// Parse DESCRIBE result to get existing columns
+	// This is a simplified parse - in production you'd want more robust parsing
+	existingCols := make(map[string]string)
+	lines := strings.Split(string(describeResult), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			colName := strings.Trim(fields[0], "`")
+			colType := fields[1]
+			existingCols[colName] = colType
 		}
 	}
 
+	// Check for columns with wrong types
+	for colName, expectedType := range t.columnDefs {
+		if existingType, exists := existingCols[colName]; exists {
+			// Normalize type comparison
+			if !strings.EqualFold(normalizeType(existingType), normalizeType(expectedType)) {
+				return fmt.Errorf("column '%s' has type '%s' but expected '%s' - manual schema fix needed", colName, existingType, expectedType)
+			}
+		}
+	}
+
+	// Add missing columns
+	var missingCols []string
+	for colName := range t.columnDefs {
+		if _, exists := existingCols[colName]; !exists {
+			missingCols = append(missingCols, colName)
+		}
+	}
+
+	if len(missingCols) == 0 {
+		log.Infof("[T %s] Doris table %s.%s schema is valid", addr.Desc(), t.config.Database, t.config.Table)
+		return nil
+	}
+
+	// Add missing columns
+	for _, colName := range missingCols {
+		colType := t.columnDefs[colName]
+		alterSQL := fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `%s` %s", t.config.Database, t.config.Table, colName, colType)
+		
+		httpRequest, err := t.createRequest(t.ctx, "POST", addr, "/api/query/default_cluster/"+t.config.Database, strings.NewReader(alterSQL))
+		if err != nil {
+			return err
+		}
+
+		httpRequest.Header.Add("Content-Type", "text/plain")
+
+		httpResponse, err := t.getClient(addr).Do(httpRequest)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(httpResponse.Body)
+		httpResponse.Body.Close()
+
+		if httpResponse.StatusCode != 200 {
+			return fmt.Errorf("failed to add column '%s': %s [Body: %s]", colName, httpResponse.Status, body)
+		}
+
+		log.Infof("[T %s] Added column '%s' to table %s.%s", addr.Desc(), colName, t.config.Database, t.config.Table)
+	}
+
+	return nil
+}
+
+// createTable creates a new table with proper schema and partitioning
+func (t *transportDoris) createTable(addr *addresspool.Address) error {
+	var columnDefs []string
+	
+	// Always include @timestamp first as it's the partition key
+	columnDefs = append(columnDefs, fmt.Sprintf("`%s` %s", "@timestamp", t.columnDefs["@timestamp"]))
+	
+	// Add other columns in a consistent order
+	for colName, colType := range t.columnDefs {
+		if colName != "@timestamp" {
+			columnDefs = append(columnDefs, fmt.Sprintf("`%s` %s", colName, colType))
+		}
+	}
+
+	// Build partition definition based on configuration
+	var partitionClause string
+	if t.config.PartitionDays == 1 {
+		// Daily partitions
+		partitionClause = "PARTITION BY RANGE(`@timestamp`) () "
+	} else {
+		// Multi-day partitions
+		partitionClause = fmt.Sprintf("PARTITION BY RANGE(`@timestamp`) () ")
+	}
+
+	// Build properties including replication and partition retention
+	properties := []string{
+		`"replication_num" = "1"`,
+		fmt.Sprintf(`"dynamic_partition.enable" = "true"`),
+		fmt.Sprintf(`"dynamic_partition.time_unit" = "DAY"`),
+		fmt.Sprintf(`"dynamic_partition.start" = "-%d"`, t.config.PartitionRetentionDays),
+		fmt.Sprintf(`"dynamic_partition.end" = "3"`),
+		fmt.Sprintf(`"dynamic_partition.prefix" = "p"`),
+		fmt.Sprintf(`"dynamic_partition.buckets" = "10"`),
+	}
+
 	createSQL := fmt.Sprintf(
-		"CREATE TABLE IF NOT EXISTS `%s`.`%s` (%s) DUPLICATE KEY(`@timestamp`) DISTRIBUTED BY HASH(`@timestamp`) BUCKETS 10 PROPERTIES (\"replication_num\" = \"1\")",
+		"CREATE TABLE `%s`.`%s` (%s) DUPLICATE KEY(`@timestamp`) %sDISTRIBUTED BY HASH(`@timestamp`) BUCKETS 10 PROPERTIES (%s)",
 		t.config.Database,
 		t.config.Table,
 		strings.Join(columnDefs, ", "),
+		partitionClause,
+		strings.Join(properties, ", "),
 	)
 
-	httpRequest, err = t.createRequest(t.ctx, "POST", addr, "/api/query/default_cluster/"+t.config.Database, strings.NewReader(createSQL))
+	httpRequest, err := t.createRequest(t.ctx, "POST", addr, "/api/query/default_cluster/"+t.config.Database, strings.NewReader(createSQL))
 	if err != nil {
 		return err
 	}
 
 	httpRequest.Header.Add("Content-Type", "text/plain")
 
-	httpResponse, err = t.getClient(addr).Do(httpRequest)
+	httpResponse, err := t.getClient(addr).Do(httpRequest)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		bufio.NewReader(httpResponse.Body).WriteTo(io.Discard)
-		httpResponse.Body.Close()
-	}()
+	body, _ := io.ReadAll(httpResponse.Body)
+	httpResponse.Body.Close()
 
 	if httpResponse.StatusCode != 200 {
-		body, _ := io.ReadAll(httpResponse.Body)
 		return fmt.Errorf("failed to create table: %s [Body: %s]", httpResponse.Status, body)
 	}
 
-	log.Infof("[T %s] Created Doris table %s.%s", addr.Desc(), t.config.Database, t.config.Table)
+	log.Infof("[T %s] Created Doris table %s.%s with %d-day retention", addr.Desc(), t.config.Database, t.config.Table, t.config.PartitionRetentionDays)
 	return nil
+}
+
+// normalizeType normalizes a Doris type for comparison
+func normalizeType(t string) string {
+	return strings.ToUpper(strings.TrimSpace(t))
 }
 
 // httpRoutine performs stream load requests to Doris
@@ -255,38 +344,37 @@ func (t *transportDoris) httpRoutine(id int) {
 				return
 			}
 
-			lastAckSequence := uint32(0)
-			request := newStreamLoadRequest(t.columnNames, t.config.RestJSONColumn, payload.events)
-
+			request := newStreamLoadRequest(t.columnDefs, t.config.RestJSONColumn, payload.events)
+			eventCount := uint32(len(payload.events))
+			
+			// Retry until successful or shutdown
 			for {
 				// Pool Next() is not race-safe
 				t.poolMutex.Lock()
 				addr, err := t.poolEntry.Next()
 				t.poolMutex.Unlock()
+				
 				if err == nil {
 					err = t.performStreamLoad(addr, id, request)
 				}
-				if err != nil {
-					log.Errorf("[T %s]{%d} Doris stream load failed: %s", addr.Desc(), id, err)
-				}
-
-				if request.AckSequence() != lastAckSequence {
-					lastAckSequence = request.AckSequence()
-
+				
+				if err == nil {
+					// Success - acknowledge all events (Doris stream load is all-or-nothing)
 					select {
 					case <-t.ctx.Done():
 						// Forced failure
 						return
-					case t.eventChan <- transports.NewAckEvent(t.ctx, payload.nonce, lastAckSequence):
+					case t.eventChan <- transports.NewAckEvent(t.ctx, payload.nonce, eventCount):
 					}
-				}
-
-				if request.Remaining() == 0 {
 					break
 				}
-
+				
+				// Log error and retry
+				log.Errorf("[T %s]{%d} Doris stream load failed: %s", addr.Desc(), id, err)
+				
 				if t.retryWait(backoff) {
-					break
+					// Shutdown requested during retry
+					return
 				}
 			}
 		}
@@ -295,11 +383,9 @@ func (t *transportDoris) httpRoutine(id int) {
 
 // performStreamLoad performs a stream load request to the Doris server
 func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, request *streamLoadRequest) error {
-	// Store what's already created so we can calculate what this specific request created
-	created := request.Created()
-
 	url := fmt.Sprintf("/api/%s/%s/_stream_load", t.config.Database, t.config.Table)
-	log.Debugf("[T %s]{%d} Performing Doris stream load of %d events to %s", addr.Desc(), id, request.Remaining(), url)
+	eventCount := request.EventCount()
+	log.Debugf("[T %s]{%d} Performing Doris stream load of %d events to %s", addr.Desc(), id, eventCount, url)
 
 	request.Reset()
 	bodyBuffer := new(bytes.Buffer)
@@ -338,7 +424,7 @@ func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, re
 		return fmt.Errorf("unexpected status: %s [Body: %s]", httpResponse.Status, body)
 	}
 
-	response, err := newStreamLoadResponse(body, request)
+	response, err := newStreamLoadResponse(body)
 	if err != nil {
 		return fmt.Errorf("response failed to parse: %s [Body: %s]", err, body)
 	}
@@ -347,11 +433,7 @@ func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, re
 		return fmt.Errorf("stream load failed with status: %s [Message: %s]", response.Status, response.Message)
 	}
 
-	if request.Remaining() == 0 {
-		log.Debugf("[T %s]{%d} Doris stream load complete (created %d; filtered %d)", addr.Desc(), id, request.Created()-created, response.NumberFilteredRows)
-	} else {
-		log.Warningf("[T %s]{%d} Doris stream load partially complete (created %d; filtered %d; retrying %d)", addr.Desc(), id, request.Created()-created, response.NumberFilteredRows, request.Remaining())
-	}
+	log.Debugf("[T %s]{%d} Doris stream load complete (loaded %d; filtered %d)", addr.Desc(), id, response.NumberLoadedRows, response.NumberFilteredRows)
 
 	return nil
 }

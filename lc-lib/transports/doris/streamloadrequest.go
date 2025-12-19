@@ -20,155 +20,79 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/driskell/log-courier/lc-lib/event"
 )
 
-type streamLoadRequestCursor struct {
-	pos   []*event.Event
-	moved bool
-}
-
 type streamLoadRequest struct {
 	// Constructor
 	events         []*event.Event
-	markCursor     *streamLoadRequestCursor
-	readCursor     *streamLoadRequestCursor
-	created        int
-	remaining      int
-	ackSequence    uint32
-	columnNames    []string
+	columnDefs     map[string]string // column name -> type
 	restJSONColumn string
 
 	// Internal
+	currentIndex int
 	currentBytes []byte
 }
 
-func newStreamLoadRequest(columnNames []string, restJSONColumn string, events []*event.Event) *streamLoadRequest {
-	eventsClone := append(events[:0:0], events...)
-
+func newStreamLoadRequest(columnDefs map[string]string, restJSONColumn string, events []*event.Event) *streamLoadRequest {
 	return &streamLoadRequest{
-		// events will be mutated and nil holes punched for successful events
-		// and anything non-nil remains outstanding
-		events:         eventsClone,
-		markCursor:     &streamLoadRequestCursor{pos: eventsClone},
-		readCursor:     &streamLoadRequestCursor{pos: eventsClone},
-		created:        0,
-		remaining:      len(events),
-		ackSequence:    0,
-		columnNames:    columnNames,
+		events:         events,
+		columnDefs:     columnDefs,
 		restJSONColumn: restJSONColumn,
+		currentIndex:   0,
 	}
 }
 
-// Created returns the number of events that have been successfully created
-func (p *streamLoadRequest) Created() int {
-	return p.created
-}
-
-// Remaining returns the number of events left to send in this request
-func (p *streamLoadRequest) Remaining() int {
-	return p.remaining
-}
-
-// AckSequence returns the sequence marking the end of the contiguous events that we can ack
-func (p *streamLoadRequest) AckSequence() uint32 {
-	return p.ackSequence
-}
-
-// Event returns the event data at the given cursor position, use nil for the beginning
-func (p *streamLoadRequest) Event(cursor *streamLoadRequestCursor) map[string]interface{} {
-	if cursor == nil {
-		return p.markCursor.pos[0].Data()
-	}
-	return cursor.pos[0].Data()
-}
-
-// Mark sets the status of the first outstanding event based on the given successful value
-// It returns a cursor which can then be passed in to mark the next item, and repeat
-// Pass in nil cursor to start from the beginning
-// Returns true when the cursor reaches the end
-func (p *streamLoadRequest) Mark(cursor *streamLoadRequestCursor, successful bool) (*streamLoadRequestCursor, bool) {
-	var currentCursor *streamLoadRequestCursor
-	if cursor == nil {
-		currentCursor = &streamLoadRequestCursor{pos: p.markCursor.pos}
-	} else {
-		currentCursor = cursor
-	}
-
-	if !successful {
-		currentCursor.pos = currentCursor.pos[1:]
-		currentCursor.moved = true
-		if len(currentCursor.pos) == 0 {
-			return nil, true
-		}
-	} else {
-		currentCursor.pos[0] = nil
-		p.remaining--
-		p.created++
-	}
-
-	for currentCursor.pos[0] == nil {
-		currentCursor.pos = currentCursor.pos[1:]
-		if !currentCursor.moved {
-			p.ackSequence++
-		}
-		if len(currentCursor.pos) == 0 {
-			break
-		}
-	}
-
-	if !currentCursor.moved {
-		p.markCursor.pos = currentCursor.pos
-	}
-
-	if len(currentCursor.pos) == 0 {
-		return nil, true
-	}
-	return currentCursor, false
+// EventCount returns the total number of events in this request
+func (p *streamLoadRequest) EventCount() int {
+	return len(p.events)
 }
 
 // Reset allows the request to be Read again
 func (p *streamLoadRequest) Reset() {
-	p.readCursor.pos = p.markCursor.pos
+	p.currentIndex = 0
+	p.currentBytes = nil
 }
 
 // Read implements io.Reader and returns a JSON array of events for Doris stream load
 func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 	for len(dst) > 0 {
 		if p.currentBytes == nil {
-			if len(p.readCursor.pos) == 0 {
+			if p.currentIndex >= len(p.events) {
 				return n, io.EOF
 			}
 
 			// Convert event to JSON object with mapped columns
-			eventData := p.readCursor.pos[0].Data()
+			eventData := p.events[p.currentIndex].Data()
 			mappedEvent := make(map[string]interface{})
 			restData := make(map[string]interface{})
 
-			// Map known columns
-			for _, colName := range p.columnNames {
-				if colName == p.restJSONColumn {
-					continue
-				}
-
-				if value, ok := eventData[colName]; ok {
-					mappedEvent[colName] = p.formatValue(colName, value)
-				} else {
-					mappedEvent[colName] = nil
-				}
-			}
-
-			// Collect unmapped fields into rest JSON column
+			// Single loop: map columns and collect unmapped fields
 			for key, value := range eventData {
-				if !p.isColumnMapped(key) && key != "@timestamp" {
-					// Include all unmapped fields, including metadata
+				if colType, isMapped := p.columnDefs[key]; isMapped {
+					// Column is mapped - format and add to mappedEvent
+					if key != p.restJSONColumn {
+						mappedEvent[key] = p.formatValue(value, colType)
+					}
+				} else if key != "@timestamp" {
+					// Unmapped field - add to rest data (exclude @timestamp as it's always mapped)
 					restData[key] = value
 				}
 			}
 
-			// Add rest JSON column if there's data
+			// Add nil values for missing mapped columns
+			for colName := range p.columnDefs {
+				if colName != p.restJSONColumn {
+					if _, exists := mappedEvent[colName]; !exists {
+						mappedEvent[colName] = nil
+					}
+				}
+			}
+
+			// Add rest JSON column
 			if len(restData) > 0 {
 				mappedEvent[p.restJSONColumn] = restData
 			} else {
@@ -181,11 +105,7 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 			}
 
 			p.currentBytes = append(jsonBytes, '\n')
-
-			p.readCursor.pos = p.readCursor.pos[1:]
-			for len(p.readCursor.pos) != 0 && p.readCursor.pos[0] == nil {
-				p.readCursor.pos = p.readCursor.pos[1:]
-			}
+			p.currentIndex++
 		}
 
 		copied := copy(dst, p.currentBytes)
@@ -203,45 +123,43 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 }
 
 // formatValue formats a value for Doris based on the column type
-func (p *streamLoadRequest) formatValue(colName string, value interface{}) interface{} {
-	if colName == "@timestamp" {
-		switch v := value.(type) {
-		case event.Timestamp:
-			return time.Time(v).Format("2006-01-02 15:04:05")
-		case time.Time:
-			return v.Format("2006-01-02 15:04:05")
-		case string:
-			return v
+func (p *streamLoadRequest) formatValue(value interface{}, colType string) interface{} {
+	// Handle event.Timestamp type regardless of column name
+	if ts, ok := value.(event.Timestamp); ok {
+		return time.Time(ts).Format("2006-01-02 15:04:05")
+	}
+	
+	// Handle time.Time for DATETIME columns
+	if colType == "DATETIME" || colType == "DATE" {
+		if t, ok := value.(time.Time); ok {
+			if colType == "DATE" {
+				return t.Format("2006-01-02")
+			}
+			return t.Format("2006-01-02 15:04:05")
 		}
 	}
 
-	if colName == "tags" {
+	// Handle event.Tags type
+	if tags, ok := value.(event.Tags); ok {
+		return []string(tags)
+	}
+
+	// Handle ARRAY<STRING> columns
+	if strings.HasPrefix(colType, "ARRAY<STRING>") {
 		switch v := value.(type) {
-		case event.Tags:
-			return []string(v)
 		case []string:
 			return v
 		case []interface{}:
-			tags := make([]string, 0, len(v))
-			for _, tag := range v {
-				if str, ok := tag.(string); ok {
-					tags = append(tags, str)
+			result := make([]string, 0, len(v))
+			for _, item := range v {
+				if str, ok := item.(string); ok {
+					result = append(result, str)
 				}
 			}
-			return tags
+			return result
 		}
 	}
 
-	// For other types, return as-is
+	// For other types, return as-is and let Doris handle conversion
 	return value
-}
-
-// isColumnMapped checks if a field is mapped to a column
-func (p *streamLoadRequest) isColumnMapped(field string) bool {
-	for _, col := range p.columnNames {
-		if col == field {
-			return true
-		}
-	}
-	return false
 }

@@ -427,12 +427,18 @@ Duration. Optional. Default: 300s
 The maximum time to wait before using a failed endpoint again. This prevents the
 exponential increase of `failure backoff` from becoming too high.
 
-### `columns`
+### `additional columns`
 
-Array of Strings. Optional. Default: ["@timestamp", "message", "host", "path", "type", "tags", "rest"]  
+Array of Strings. Optional. Default: []  
 Available when `transport` is one of: `doris`, `doris-https`
 
-The list of column names in the Doris table. Events will be mapped to these columns. Fields not mapped to a column will be collected in the [`rest json column`](#rest-json-column). If the table doesn't exist, it will be created with these columns.
+Additional columns to create beyond the default set. The default columns are: `@timestamp` (DATETIME), `message` (STRING), `host` (STRING), `path` (STRING), `type` (STRING), `tags` (ARRAY<STRING>), and the rest JSON column.
+
+Each entry can be either `name` (defaults to STRING type) or `name:type` to specify a type. Valid types: STRING, INT, BIGINT, DOUBLE, FLOAT, BOOLEAN, DATE, DATETIME, JSON.
+
+Examples: `["clientip", "response:INT", "bytes:BIGINT"]`
+
+If the table doesn't exist, it will be created. If it exists but is missing columns, they will be added automatically. If column types don't match, an error will be raised requiring manual schema fix.
 
 ### `database`
 
@@ -453,6 +459,20 @@ Map of Strings. Optional. Default: {}
 Available when `transport` is one of: `doris`, `doris-https`
 
 Additional properties to send as HTTP headers during Doris stream load operations. These are passed directly to the Doris stream load API. For example, `{"max_filter_ratio": "0.1"}` would set the maximum ratio of filtered rows allowed.
+
+### `partition days`
+
+Number. Optional. Default: 1  
+Available when `transport` is one of: `doris`, `doris-https`
+
+The number of days per partition. Default is 1 for daily partitions.
+
+### `partition retention days`
+
+Number. Optional. Default: 90  
+Available when `transport` is one of: `doris`, `doris-https`
+
+The number of days to retain partitions. Old partitions beyond this retention period will be automatically dropped. Default is 90 days.
 
 ### `max pending payloads`
 

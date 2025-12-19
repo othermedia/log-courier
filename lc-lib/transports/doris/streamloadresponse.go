@@ -41,21 +41,12 @@ type streamLoadResponse struct {
 	ErrorURL           string `json:"ErrorURL"`
 }
 
-// newStreamLoadResponse parses a stream load response and marks events as successful
-func newStreamLoadResponse(body []byte, request *streamLoadRequest) (*streamLoadResponse, error) {
+// newStreamLoadResponse parses a stream load response
+// Note: Doris stream load is atomic - either all events succeed or all fail
+func newStreamLoadResponse(body []byte) (*streamLoadResponse, error) {
 	response := &streamLoadResponse{}
 	if err := json.Unmarshal(body, response); err != nil {
 		return nil, fmt.Errorf("failed to parse response JSON: %s", err)
-	}
-
-	// Mark all events as successful if the load succeeded
-	// In Doris, stream load is atomic - either all succeed or all fail
-	if response.Status == "Success" || response.Status == "Publish Timeout" {
-		cursor := (*streamLoadRequestCursor)(nil)
-		done := false
-		for !done {
-			cursor, done = request.Mark(cursor, true)
-		}
 	}
 
 	return response, nil

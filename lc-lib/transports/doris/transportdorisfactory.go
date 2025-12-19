@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/driskell/log-courier/lc-lib/addresspool"
@@ -28,11 +29,13 @@ import (
 )
 
 const (
-	defaultRoutines       int           = 4
-	defaultRetry          time.Duration = 0 * time.Second
-	defaultRetryMax       time.Duration = 300 * time.Second
-	defaultDatabase       string        = "default"
-	defaultRestJSONColumn string        = "rest"
+	defaultRoutines             int           = 4
+	defaultRetry                time.Duration = 0 * time.Second
+	defaultRetryMax             time.Duration = 300 * time.Second
+	defaultDatabase             string        = "default"
+	defaultRestJSONColumn       string        = "rest"
+	defaultPartitionDays        int           = 1
+	defaultPartitionRetentionDays int         = 90
 )
 
 var (
@@ -50,16 +53,21 @@ type TransportDorisFactory struct {
 	transport string
 
 	// Configuration
-	Database       string            `config:"database"`
-	Table          string            `config:"table"`
-	Columns        []string          `config:"columns"`
-	RestJSONColumn string            `config:"rest json column"`
-	Password       string            `config:"password"`
-	Retry          time.Duration     `config:"retry backoff"`
-	RetryMax       time.Duration     `config:"retry backoff max"`
-	Routines       int               `config:"routines"`
-	Username       string            `config:"username"`
-	LoadProperties map[string]string `config:"load properties"`
+	Database              string            `config:"database"`
+	Table                 string            `config:"table"`
+	AdditionalColumns     []string          `config:"additional columns"`
+	RestJSONColumn        string            `config:"rest json column"`
+	Password              string            `config:"password"`
+	Retry                 time.Duration     `config:"retry backoff"`
+	RetryMax              time.Duration     `config:"retry backoff max"`
+	Routines              int               `config:"routines"`
+	Username              string            `config:"username"`
+	LoadProperties        map[string]string `config:"load properties"`
+	PartitionDays         int               `config:"partition days"`
+	PartitionRetentionDays int              `config:"partition retention days"`
+	
+	// Internal - parsed column definitions
+	additionalColumnDefs map[string]string
 
 	*transports.ClientTlsConfiguration `config:",embed"`
 }
@@ -98,8 +106,38 @@ func (f *TransportDorisFactory) Validate(p *config.Parser, configPath string) (e
 		return fmt.Errorf("%srest json column is required", configPath)
 	}
 
-	// Columns are optional - if not specified, we'll use defaults
-	// based on common event fields
+	if f.PartitionDays < 1 {
+		return fmt.Errorf("%spartition days cannot be less than 1", configPath)
+	}
+
+	if f.PartitionRetentionDays < 1 {
+		return fmt.Errorf("%spartition retention days cannot be less than 1", configPath)
+	}
+
+	// Parse additional columns and their types
+	f.additionalColumnDefs = make(map[string]string)
+	for _, col := range f.AdditionalColumns {
+		parts := strings.Split(col, ":")
+		if len(parts) == 1 {
+			// No type specified, default to STRING
+			f.additionalColumnDefs[parts[0]] = "STRING"
+		} else if len(parts) == 2 {
+			colName := parts[0]
+			colType := strings.ToUpper(parts[1])
+			// Validate type
+			validTypes := map[string]bool{
+				"STRING": true, "INT": true, "BIGINT": true, "DOUBLE": true,
+				"FLOAT": true, "BOOLEAN": true, "DATE": true, "DATETIME": true,
+				"JSON": true,
+			}
+			if !validTypes[colType] {
+				return fmt.Errorf("%sadditional columns: invalid type '%s' for column '%s'", configPath, parts[1], colName)
+			}
+			f.additionalColumnDefs[colName] = colType
+		} else {
+			return fmt.Errorf("%sadditional columns: invalid format '%s', expected 'name' or 'name:type'", configPath, col)
+		}
+	}
 
 	return f.ClientTlsConfiguration.TlsValidate(f.transport == TransportDorisHTTPS, p, configPath)
 }
@@ -111,6 +149,8 @@ func (f *TransportDorisFactory) Defaults() {
 	f.RetryMax = defaultRetryMax
 	f.Database = defaultDatabase
 	f.RestJSONColumn = defaultRestJSONColumn
+	f.PartitionDays = defaultPartitionDays
+	f.PartitionRetentionDays = defaultPartitionRetentionDays
 	f.LoadProperties = make(map[string]string)
 }
 
@@ -143,7 +183,7 @@ func (t *TransportDorisFactory) ShouldRestart(newConfig transports.TransportFact
 	if newConfigImpl.Table != t.Table {
 		return true
 	}
-	if !reflect.DeepEqual(newConfigImpl.Columns, t.Columns) {
+	if !reflect.DeepEqual(newConfigImpl.AdditionalColumns, t.AdditionalColumns) {
 		return true
 	}
 	if newConfigImpl.RestJSONColumn != t.RestJSONColumn {
@@ -165,6 +205,12 @@ func (t *TransportDorisFactory) ShouldRestart(newConfig transports.TransportFact
 		return true
 	}
 	if !reflect.DeepEqual(newConfigImpl.LoadProperties, t.LoadProperties) {
+		return true
+	}
+	if newConfigImpl.PartitionDays != t.PartitionDays {
+		return true
+	}
+	if newConfigImpl.PartitionRetentionDays != t.PartitionRetentionDays {
 		return true
 	}
 
