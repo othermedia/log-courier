@@ -130,38 +130,19 @@ func (t *transportDoris) setupAssociation() bool {
 		return true
 	}
 
+MetadataConnectLoop:
 	for {
-		if t.tryMetadataServers(metadataEntries) {
-			// Successfully initialized schema
-			return false
-		}
-
-		// All servers failed - wait and retry
-		if t.retryWait(backoff) {
-			break
-		}
-	}
-
-	// Shutdown
-	return true
-}
-
-// tryMetadataServers attempts to initialize schema on any available metadata server
-// Returns true on success, false if all servers failed with connection errors
-func (t *transportDoris) tryMetadataServers(metadataEntries []*addresspool.PoolEntry) bool {
-	for _, metadataEntry := range metadataEntries {
-		// Try all addresses from this pool entry
-		for {
+		for _, metadataEntry := range metadataEntries {
 			addr, err := metadataEntry.Next()
 			if err != nil {
-				// No more addresses from this entry
-				break
+				log.Errorf("[T %s] Metadata server lookup failure: %s", t.poolEntry.Server, err)
+				return true
 			}
 
 			connected, err := t.tableMgr.InitializeSchema(t.poolEntry, addr)
 			if err == nil {
 				// Success
-				return true
+				break MetadataConnectLoop
 			}
 
 			// Check if connection failed (retryable) or schema error (fatal)
@@ -174,10 +155,14 @@ func (t *transportDoris) tryMetadataServers(metadataEntries []*addresspool.PoolE
 			// Connection error - try next server
 			log.Warningf("[T %s]{%s} Failed to connect: %s, trying next metadata server", t.poolEntry.Server, addr.Desc(), err)
 		}
+
+		// All metadata servers failed - wait and retry
+		if t.retryWait(backoff) {
+			// Shutdown requested during retry
+			return true
+		}
 	}
 
-	// All metadata servers failed with connection errors
-	log.Errorf("[T %s] All metadata servers failed with connection errors", t.poolEntry.Server)
 	return false
 }
 
