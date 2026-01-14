@@ -35,6 +35,7 @@ type streamLoadRequest struct {
 	// Internal
 	currentIndex int
 	currentBytes []byte
+	len          int
 }
 
 func newStreamLoadRequest(columnDefs map[string]string, restJSONColumn string, events []*event.Event) *streamLoadRequest {
@@ -55,6 +56,12 @@ func (p *streamLoadRequest) EventCount() int {
 func (p *streamLoadRequest) Reset() {
 	p.currentIndex = 0
 	p.currentBytes = nil
+	p.len = 0
+}
+
+// Len returns the total number of bytes read so far
+func (p *streamLoadRequest) Len() int {
+	return p.len
 }
 
 // Read implements io.Reader and returns a JSON array of events for Doris stream load
@@ -77,8 +84,8 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 					if key != p.restJSONColumn {
 						mappedEvent[key] = p.formatValue(value, colType)
 					}
-				} else if key != "@timestamp" {
-					// Unmapped field - add to rest data (exclude @timestamp as it's always mapped)
+				} else if key != "@timestamp" && key != "@metadata" {
+					// Unmapped field - add to rest data (exclude @ prefixed metadata fields)
 					restData[key] = value
 				}
 			}
@@ -116,6 +123,7 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 		}
 
 		n += copied
+		p.len += copied
 		dst = dst[copied:]
 	}
 

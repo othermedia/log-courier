@@ -23,22 +23,26 @@ import (
 
 // streamLoadResponse represents the response from a Doris stream load request
 type streamLoadResponse struct {
-	TxnID              int64  `json:"TxnId"`
-	Label              string `json:"Label"`
-	Status             string `json:"Status"`
-	Message            string `json:"Message"`
-	NumberTotalRows    int    `json:"NumberTotalRows"`
-	NumberLoadedRows   int    `json:"NumberLoadedRows"`
-	NumberFilteredRows int    `json:"NumberFilteredRows"`
-	NumberUnselectedRows int  `json:"NumberUnselectedRows"`
-	LoadBytes          int64  `json:"LoadBytes"`
-	LoadTimeMs         int    `json:"LoadTimeMs"`
-	BeginTxnTimeMs     int    `json:"BeginTxnTimeMs"`
-	StreamLoadPutTimeMs int   `json:"StreamLoadPutTimeMs"`
-	ReadDataTimeMs     int    `json:"ReadDataTimeMs"`
-	WriteDataTimeMs    int    `json:"WriteDataTimeMs"`
-	CommitAndPublishTimeMs int `json:"CommitAndPublishTimeMs"`
-	ErrorURL           string `json:"ErrorURL"`
+	TxnID                  int64  `json:"TxnId"`
+	Label                  string `json:"Label"`
+	Comment                string `json:"Comment"`
+	TwoPhaseCommit         string `json:"TwoPhaseCommit"`
+	Status                 string `json:"Status"`
+	Message                string `json:"Message"`
+	NumberTotalRows        int    `json:"NumberTotalRows"`
+	NumberLoadedRows       int    `json:"NumberLoadedRows"`
+	NumberFilteredRows     int    `json:"NumberFilteredRows"`
+	NumberUnselectedRows   int    `json:"NumberUnselectedRows"`
+	LoadBytes              int64  `json:"LoadBytes"`
+	LoadTimeMs             int    `json:"LoadTimeMs"`
+	BeginTxnTimeMs         int    `json:"BeginTxnTimeMs"`
+	StreamLoadPutTimeMs    int    `json:"StreamLoadPutTimeMs"`
+	ReadDataTimeMs         int    `json:"ReadDataTimeMs"`
+	WriteDataTimeMs        int    `json:"WriteDataTimeMs"`
+	ReceiveDataTimeMs      int    `json:"ReceiveDataTimeMs"`
+	CommitAndPublishTimeMs int    `json:"CommitAndPublishTimeMs"`
+	ErrorURL               string `json:"ErrorURL"`
+	FirstErrorMessage      string `json:"FirstErrorMessage"`
 }
 
 // newStreamLoadResponse parses a stream load response

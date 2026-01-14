@@ -29,13 +29,13 @@ import (
 )
 
 const (
-	defaultRoutines             int           = 4
-	defaultRetry                time.Duration = 0 * time.Second
-	defaultRetryMax             time.Duration = 300 * time.Second
-	defaultDatabase             string        = "default"
-	defaultRestJSONColumn       string        = "rest"
-	defaultPartitionDays        int           = 1
-	defaultPartitionRetentionDays int         = 90
+	defaultRoutines               int           = 4
+	defaultRetry                  time.Duration = 0 * time.Second
+	defaultRetryMax               time.Duration = 300 * time.Second
+	defaultDatabase               string        = "default"
+	defaultRestJSONColumn         string        = "rest"
+	defaultPartitionDays          int           = 1
+	defaultPartitionRetentionDays int           = 90
 )
 
 var (
@@ -53,21 +53,23 @@ type TransportDorisFactory struct {
 	transport string
 
 	// Configuration
-	Database              string            `config:"database"`
-	Table                 string            `config:"table"`
-	AdditionalColumns     []string          `config:"additional columns"`
-	RestJSONColumn        string            `config:"rest json column"`
-	Password              string            `config:"password"`
-	Retry                 time.Duration     `config:"retry backoff"`
-	RetryMax              time.Duration     `config:"retry backoff max"`
-	Routines              int               `config:"routines"`
-	Username              string            `config:"username"`
-	LoadProperties        map[string]string `config:"load properties"`
-	PartitionDays         int               `config:"partition days"`
-	PartitionRetentionDays int              `config:"partition retention days"`
+	Database               string            `config:"database"`
+	Table                  string            `config:"table"`
+	MetadataServers        []string          `config:"metadata servers"`
+	AdditionalColumns      []string          `config:"additional columns"`
+	RestJSONColumn         string            `config:"rest json column"`
+	Password               string            `config:"password"`
+	Retry                  time.Duration     `config:"retry backoff"`
+	RetryMax               time.Duration     `config:"retry backoff max"`
+	Routines               int               `config:"routines"`
+	Username               string            `config:"username"`
+	LoadProperties         map[string]string `config:"load properties"`
+	PartitionDays          int               `config:"partition days"`
+	PartitionRetentionDays int               `config:"partition retention days"`
 
 	// Internal - parsed column definitions
 	additionalColumnDefs map[string]string
+	metadataEntries      []*addresspool.PoolEntry
 
 	*transports.ClientTlsConfiguration `config:",embed"`
 }
@@ -102,6 +104,17 @@ func (f *TransportDorisFactory) Validate(p *config.Parser, configPath string) (e
 		return fmt.Errorf("%stable is required", configPath)
 	}
 
+	if len(f.MetadataServers) != 0 {
+		// Validate metadata servers uniqueness
+		metadataServers := make(map[string]bool)
+		for _, server := range f.MetadataServers {
+			if _, exists := metadataServers[server]; exists {
+				return fmt.Errorf("%smetadata servers must be unique: %s appears multiple times", configPath, server)
+			}
+			metadataServers[server] = true
+		}
+	}
+
 	if f.RestJSONColumn == "" {
 		return fmt.Errorf("%srest json column is required", configPath)
 	}
@@ -109,7 +122,7 @@ func (f *TransportDorisFactory) Validate(p *config.Parser, configPath string) (e
 	if f.PartitionRetentionDays < 1 {
 		return fmt.Errorf("%spartition retention days cannot be less than 1", configPath)
 	}
-	
+
 	// Note: PartitionDays is reserved for future use to support multi-day partitions
 	// Currently only daily partitions are supported
 	if f.PartitionDays != 1 {
@@ -183,6 +196,9 @@ func (t *TransportDorisFactory) ShouldRestart(newConfig transports.TransportFact
 		return true
 	}
 	if newConfigImpl.Table != t.Table {
+		return true
+	}
+	if !reflect.DeepEqual(newConfigImpl.MetadataServers, t.MetadataServers) {
 		return true
 	}
 	if !reflect.DeepEqual(newConfigImpl.AdditionalColumns, t.AdditionalColumns) {
