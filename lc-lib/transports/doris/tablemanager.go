@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -214,10 +215,26 @@ func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntr
 func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string, db *sql.DB) error {
 	log.Infof("[T %s]{%s} Creating new table %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, table)
 
-	var columnDefs []string
+	columnDefs := make([]string, 0, len(tm.columnDefs))
 	for colName, colType := range tm.columnDefs {
 		columnDefs = append(columnDefs, fmt.Sprintf("`%s` %s", colName, colType))
 	}
+	// Sort by column name for consistency but force @timestamp first, and type second
+	sort.SliceStable(columnDefs, func(i, j int) bool {
+		if strings.HasPrefix(columnDefs[i], "`@timestamp`") {
+			return true
+		}
+		if strings.HasPrefix(columnDefs[j], "`@timestamp`") {
+			return false
+		}
+		if strings.HasPrefix(columnDefs[i], "`type`") {
+			return true
+		}
+		if strings.HasPrefix(columnDefs[j], "`type`") {
+			return false
+		}
+		return columnDefs[i] < columnDefs[j]
+	})
 
 	// Build properties including replication and partition retention
 	properties := []string{
