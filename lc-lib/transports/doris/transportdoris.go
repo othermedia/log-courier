@@ -272,6 +272,9 @@ func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, ta
 	eventCount := request.EventCount()
 	log.Debugf("[T %s]{%d} Performing Doris stream load of %d events to %s", addr.Desc(), id, eventCount, url)
 
+	buff, _ := io.ReadAll(request)
+	log.Noticef("BODY = %s", buff)
+
 	request.Reset()
 
 	httpRequest, err := t.createRequest(t.ctx, "PUT", addr, url, request)
