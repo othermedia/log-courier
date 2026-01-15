@@ -30,6 +30,7 @@ import (
 type tableManager struct {
 	config     *TransportDorisFactory
 	columnDefs map[string]string
+	indexDefs  []string
 }
 
 // newTableManager creates a new table manager instance
@@ -41,17 +42,23 @@ func newTableManager(config *TransportDorisFactory) *tableManager {
 
 // InitializeSchema initializes column definitions and ensures the table exists with necessary columns
 // Returns (connected, error) where connected indicates if SQL connection was successful
-func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr *addresspool.Address) (bool, error) {
+func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string) (bool, error) {
 	// Initialize column definitions with hard-coded defaults
 	tm.columnDefs = map[string]string{
 		"@timestamp":             "datetime",
-		"message":                "text",
+		"type":                   "text",
 		"host":                   "text",
 		"path":                   "text",
 		"offset":                 "bigint",
-		"type":                   "text",
 		"tags":                   "array<text>",
-		tm.config.RestJSONColumn: "json",
+		"message":                "text",
+		tm.config.RestJSONColumn: "variant",
+	}
+
+	tm.indexDefs = []string{
+		"INDEX `idx_tags`(`tags`) USING INVERTED",
+		"INDEX `idx_message`(`message`) USING INVERTED PROPERTIES(\"parser\"=\"basic\")",
+		fmt.Sprintf("INDEX `idx_%[1]s`(`%[1]s`) USING INVERTED PROPERTIES(\"parser\"=\"basic\")", tm.config.RestJSONColumn),
 	}
 
 	// Add additional columns from configuration
@@ -67,16 +74,16 @@ func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr 
 	defer db.Close()
 
 	// Check if table exists using DESCRIBE
-	describeSQL := fmt.Sprintf("DESCRIBE `%s`.`%s`", tm.config.Database, tm.config.Table)
+	describeSQL := fmt.Sprintf("DESCRIBE `%s`.`%s`", tm.config.Database, table)
 	rows, err := db.Query(describeSQL)
 	if err != nil {
 		// Table likely doesn't exist - create it
-		return true, tm.createTable(poolEntry, addr, db)
+		return true, tm.createTable(poolEntry, addr, table, db)
 	}
 	defer rows.Close()
 
 	// Table exists - check columns
-	return true, tm.validateAndUpdateColumns(poolEntry, addr, db, rows)
+	return true, tm.validateAndUpdateColumns(poolEntry, addr, table, db, rows)
 }
 
 // ColumnDefs returns the column definitions
@@ -118,8 +125,8 @@ func (tm *tableManager) connectSQL(poolEntry *addresspool.PoolEntry, addr *addre
 }
 
 // validateAndUpdateColumns validates existing columns and adds missing ones
-func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, db *sql.DB, rows *sql.Rows) error {
-	log.Infof("[T %s]{%s} Validating existing table schema", poolEntry.Server, addr.Desc())
+func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string, db *sql.DB, rows *sql.Rows) error {
+	log.Infof("[T %s]{%s} Validating existing table schema for %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, table)
 	// Parse DESCRIBE result to get existing columns
 	existingCols := make(map[string]string)
 
@@ -183,43 +190,34 @@ func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntr
 	}
 
 	if len(missingCols) == 0 {
-		log.Infof("[T %s]{%s} Doris table %s.%s schema is valid", poolEntry.Server, addr.Desc(), tm.config.Database, tm.config.Table)
+		log.Infof("[T %s]{%s} Doris table %s.%s schema is valid", poolEntry.Server, addr.Desc(), tm.config.Database, table)
 		return nil
 	}
 
 	// Add missing columns
 	for _, colName := range missingCols {
 		colType := tm.columnDefs[colName]
-		alterSQL := fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `%s` %s", tm.config.Database, tm.config.Table, colName, colType)
+		alterSQL := fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `%s` %s", tm.config.Database, table, colName, colType)
 
 		_, err := db.Exec(alterSQL)
 		if err != nil {
 			return fmt.Errorf("failed to add column '%s': %s", colName, err)
 		}
 
-		log.Infof("[T %s]{%s} Added column '%s' to table %s.%s", poolEntry.Server, addr.Desc(), colName, tm.config.Database, tm.config.Table)
+		log.Infof("[T %s]{%s} Added column '%s' to table %s.%s", poolEntry.Server, addr.Desc(), colName, tm.config.Database, table)
 	}
 
 	return nil
 }
 
 // createTable creates a new table with proper schema and partitioning
-func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, db *sql.DB) error {
-	log.Infof("[T %s]{%s} Creating new table %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, tm.config.Table)
+func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string, db *sql.DB) error {
+	log.Infof("[T %s]{%s} Creating new table %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, table)
+
 	var columnDefs []string
-
-	// Always include @timestamp first as it's the partition key
-	columnDefs = append(columnDefs, fmt.Sprintf("`%s` %s", "@timestamp", tm.columnDefs["@timestamp"]))
-
-	// Add other columns in a consistent order
 	for colName, colType := range tm.columnDefs {
-		if colName != "@timestamp" {
-			columnDefs = append(columnDefs, fmt.Sprintf("`%s` %s", colName, colType))
-		}
+		columnDefs = append(columnDefs, fmt.Sprintf("`%s` %s", colName, colType))
 	}
-
-	// Build partition definition
-	partitionClause := "PARTITION BY RANGE(`@timestamp`) () "
 
 	// Build properties including replication and partition retention
 	properties := []string{
@@ -233,11 +231,16 @@ func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addr
 	}
 
 	createSQL := fmt.Sprintf(
-		"CREATE TABLE `%s`.`%s` (%s) DUPLICATE KEY(`@timestamp`, `type`) %sDISTRIBUTED BY HASH(`type`) BUCKETS 10 PROPERTIES (%s)",
+		"CREATE TABLE `%s`.`%s` "+
+			"(%s, %s) "+
+			"DUPLICATE KEY(`@timestamp`, `type`) "+
+			"PARTITION BY RANGE(`@timestamp`) () "+
+			"DISTRIBUTED BY HASH(`type`) BUCKETS 10 "+
+			"PROPERTIES (%s)",
 		tm.config.Database,
-		tm.config.Table,
+		table,
 		strings.Join(columnDefs, ", "),
-		partitionClause,
+		strings.Join(tm.indexDefs, ", "),
 		strings.Join(properties, ", "),
 	)
 
@@ -246,7 +249,7 @@ func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addr
 		return fmt.Errorf("failed to create table: %s", err)
 	}
 
-	log.Infof("[T %s]{%s} Created Doris table %s.%s with %d-day retention", poolEntry.Server, addr.Desc(), tm.config.Database, tm.config.Table, tm.config.PartitionRetentionDays)
+	log.Infof("[T %s]{%s} Created Doris table %s.%s with %d-day retention", poolEntry.Server, addr.Desc(), tm.config.Database, table, tm.config.PartitionRetentionDays)
 	return nil
 }
 

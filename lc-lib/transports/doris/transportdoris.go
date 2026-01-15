@@ -37,6 +37,8 @@ import (
 var (
 	// ErrInvalidState occurs when a send cannot happen because the connection has closed
 	ErrInvalidState = errors.New("invalid connection state")
+
+	tableSchemaLock sync.Mutex
 )
 
 // payload contains nonce and events information
@@ -62,11 +64,13 @@ type transportDoris struct {
 	eventChan    chan<- transports.Event
 
 	// Internal
-	payloadChan  chan *payload
-	payloadMutex sync.Mutex
-	poolMutex    sync.Mutex
-	wait         sync.WaitGroup
-	tableMgr     *tableManager // table manager for schema operations
+	payloadChan    chan *payload
+	payloadMutex   sync.Mutex
+	poolMutex      sync.Mutex
+	wait           sync.WaitGroup
+	tablePattern   event.Pattern
+	preparedTables map[string]bool
+	tableMgr       *tableManager
 }
 
 // Factory returns the associated factory
@@ -90,11 +94,6 @@ func (t *transportDoris) controllerRoutine() {
 		t.eventChan <- transports.NewStatusEvent(t.ctx, transports.Finished, nil)
 	}()
 
-	if t.setupAssociation() {
-		// Shutdown was requested
-		return
-	}
-
 	// Setup payload chan with max write count of pending payloads
 	t.payloadMutex.Lock()
 	t.payloadChan = make(chan *payload, t.netConfig.MaxPendingPayloads)
@@ -116,8 +115,18 @@ func (t *transportDoris) controllerRoutine() {
 	t.shutdownFunc()
 }
 
-// setupAssociation ensures table and columns exist
-func (t *transportDoris) setupAssociation() bool {
+// prepareTableSchema prepares the table schema by connecting to metadata servers
+// and creating or validating the table
+func (t *transportDoris) prepareTableSchema(table string) bool {
+	if _, ok := t.preparedTables[table]; ok {
+		// Already prepared
+		return false
+	}
+	t.preparedTables[table] = true
+
+	defer tableSchemaLock.Unlock()
+	tableSchemaLock.Lock()
+
 	backoffName := fmt.Sprintf("[T %s] Setup Retry", t.poolEntry.Server)
 	backoff := core.NewExpBackoff(backoffName, t.config.Retry, t.config.RetryMax)
 
@@ -139,7 +148,7 @@ MetadataConnectLoop:
 				return true
 			}
 
-			connected, err := t.tableMgr.InitializeSchema(t.poolEntry, addr)
+			connected, err := t.tableMgr.InitializeSchema(t.poolEntry, addr, table)
 			if err == nil {
 				// Success
 				break MetadataConnectLoop
@@ -187,37 +196,64 @@ func (t *transportDoris) httpRoutine(id int) {
 				return
 			}
 
-			request := newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, payload.events)
+			// If using a static pattern, simplify the requests we need to send
+			// Otherwise if a pattern, we need to calculate multiple stream loads,
+			// one per table name
+			var requests map[string]*streamLoadRequest
+			if t.tablePattern.IsStatic() {
+				requests = map[string]*streamLoadRequest{
+					t.config.TablePattern: newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, payload.events),
+				}
+			} else {
+				eventsByTable := make(map[string][]*event.Event)
+				for _, ev := range payload.events {
+					tableName, err := t.tablePattern.Format(ev)
+					if err != nil {
+						log.Errorf("[T %s]{%d} Failed to determine table name for event: %s", t.poolEntry.Server, id, err)
+						continue
+					}
+					eventsByTable[tableName] = append(eventsByTable[tableName], ev)
+				}
+				requests = make(map[string]*streamLoadRequest)
+				for tableName, events := range eventsByTable {
+					requests[tableName] = newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, events)
+				}
+			}
+
 			eventCount := uint32(len(payload.events))
 
-			// Retry until successful or shutdown
-			for {
-				// Pool Next() is not race-safe
-				t.poolMutex.Lock()
-				addr, err := t.poolEntry.Next()
-				t.poolMutex.Unlock()
-
-				if err == nil {
-					err = t.performStreamLoad(addr, id, request, payload.nonce)
-				}
-
-				if err == nil {
-					// Success - acknowledge all events (Doris stream load is all-or-nothing)
-					select {
-					case <-t.ctx.Done():
-						// Forced failure
-						return
-					case t.eventChan <- transports.NewAckEvent(t.ctx, payload.nonce, eventCount):
-					}
-					break
-				}
-
-				// Log error and retry
-				log.Errorf("[T %s]{%d} Doris stream load failed: %s", addr.Desc(), id, err)
-
-				if t.retryWait(backoff) {
-					// Shutdown requested during retry
+			for tableName, request := range requests {
+				// Ensure table schema is prepared
+				if t.prepareTableSchema(tableName) {
+					// Error during schema preparation or shutdown
 					return
+				}
+
+				// Retry until successful or shutdown
+				for {
+					t.poolMutex.Lock()
+					addr, err := t.poolEntry.Next()
+					t.poolMutex.Unlock()
+
+					if err == nil {
+						err = t.performStreamLoad(addr, id, tableName, request, payload.nonce)
+					}
+
+					if err == nil {
+						select {
+						case <-t.ctx.Done():
+							// Forced failure
+							return
+						case t.eventChan <- transports.NewAckEvent(t.ctx, payload.nonce, eventCount):
+						}
+						break
+					}
+
+					log.Errorf("[T %s]{%d} Doris stream load failed: %s", addr.Desc(), id, err)
+
+					if t.retryWait(backoff) {
+						return
+					}
 				}
 			}
 		}
@@ -225,8 +261,8 @@ func (t *transportDoris) httpRoutine(id int) {
 }
 
 // performStreamLoad performs a stream load request to the Doris server
-func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, request *streamLoadRequest, nonce *string) error {
-	url := fmt.Sprintf("/api/%s/%s/_stream_load", t.config.Database, t.config.Table)
+func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, tableName string, request *streamLoadRequest, nonce *string) error {
+	url := fmt.Sprintf("/api/%s/%s/_stream_load", t.config.Database, tableName)
 	eventCount := request.EventCount()
 	log.Debugf("[T %s]{%d} Performing Doris stream load of %d events to %s", addr.Desc(), id, eventCount, url)
 
@@ -248,7 +284,7 @@ func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, re
 	httpRequest.Header.Add("Expect", "100-continue")
 	httpRequest.Header.Add("format", "json")
 	httpRequest.Header.Add("read_json_by_line", "true")
-	httpRequest.Header.Add("label", fmt.Sprintf("log-courier-%x", *nonce))
+	httpRequest.Header.Add("label", fmt.Sprintf("log-courier-%s-%x", tableName, *nonce))
 
 	httpResponse, err := t.getClient(addr).Do(httpRequest)
 	if err != nil {

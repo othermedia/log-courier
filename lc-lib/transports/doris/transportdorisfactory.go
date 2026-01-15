@@ -54,7 +54,7 @@ type TransportDorisFactory struct {
 
 	// Configuration
 	Database               string            `config:"database"`
-	Table                  string            `config:"table"`
+	TablePattern           string            `config:"table pattern"`
 	MetadataServers        []string          `config:"metadata servers"`
 	AdditionalColumns      []string          `config:"additional columns"`
 	RestJSONColumn         string            `config:"rest json column"`
@@ -100,8 +100,8 @@ func (f *TransportDorisFactory) Validate(p *config.Parser, configPath string) (e
 		return fmt.Errorf("%sdatabase is required", configPath)
 	}
 
-	if f.Table == "" {
-		return fmt.Errorf("%stable is required", configPath)
+	if f.TablePattern == "" {
+		return fmt.Errorf("%stable pattern is required", configPath)
 	}
 
 	if len(f.MetadataServers) != 0 {
@@ -175,13 +175,14 @@ func (f *TransportDorisFactory) NewTransport(ctx context.Context, poolEntry *add
 	ctx, shutdownFunc := context.WithCancel(ctx)
 
 	ret := &transportDoris{
-		ctx:          ctx,
-		shutdownFunc: shutdownFunc,
-		config:       f,
-		netConfig:    transports.FetchConfig(f.config),
-		poolEntry:    poolEntry,
-		eventChan:    eventChan,
-		clientCache:  make(map[string]*clientCacheItem),
+		ctx:            ctx,
+		shutdownFunc:   shutdownFunc,
+		config:         f,
+		netConfig:      transports.FetchConfig(f.config),
+		poolEntry:      poolEntry,
+		eventChan:      eventChan,
+		clientCache:    make(map[string]*clientCacheItem),
+		preparedTables: make(map[string]bool),
 	}
 
 	ret.startController()
@@ -195,7 +196,7 @@ func (t *TransportDorisFactory) ShouldRestart(newConfig transports.TransportFact
 	if newConfigImpl.Database != t.Database {
 		return true
 	}
-	if newConfigImpl.Table != t.Table {
+	if newConfigImpl.TablePattern != t.TablePattern {
 		return true
 	}
 	if !reflect.DeepEqual(newConfigImpl.MetadataServers, t.MetadataServers) {
