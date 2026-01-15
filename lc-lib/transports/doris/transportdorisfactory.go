@@ -25,6 +25,7 @@ import (
 
 	"github.com/driskell/log-courier/lc-lib/addresspool"
 	"github.com/driskell/log-courier/lc-lib/config"
+	"github.com/driskell/log-courier/lc-lib/event"
 	"github.com/driskell/log-courier/lc-lib/transports"
 )
 
@@ -183,6 +184,7 @@ func (f *TransportDorisFactory) NewTransport(ctx context.Context, poolEntry *add
 		eventChan:      eventChan,
 		clientCache:    make(map[string]*clientCacheItem),
 		preparedTables: make(map[string]bool),
+		tablePattern:   event.NewPatternFromString(f.TablePattern),
 	}
 
 	ret.startController()
