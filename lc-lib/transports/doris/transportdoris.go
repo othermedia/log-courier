@@ -120,7 +120,7 @@ func (t *transportDoris) controllerRoutine() {
 
 // prepareTableSchema prepares the table schema by connecting to metadata servers
 // and creating or validating the table
-func (t *transportDoris) prepareTableSchema(table string) bool {
+func (t *transportDoris) prepareTableSchema(id int, table string) bool {
 	if _, ok := t.preparedTables[table]; ok {
 		// Already prepared
 		return false
@@ -157,12 +157,12 @@ MetadataConnectLoop:
 			// Check if connection failed (retryable) or schema error (fatal)
 			if connected {
 				// Connected but schema operation failed - fatal error
-				log.Errorf("[T %s]{%s} Failed to initialize Doris table schema: %s", t.poolEntry.Server, addr.Desc(), err)
+				log.Errorf("[T %s]{%d}{%s} Failed to initialize Doris table schema: %s", t.poolEntry.Server, id, addr.Desc(), err)
 				return true
 			}
 
 			// Connection error - try next server
-			log.Warningf("[T %s]{%s} Failed to connect: %s, trying next metadata server", t.poolEntry.Server, addr.Desc(), err)
+			log.Warningf("[T %s]{%d}{%s} Failed to connect: %s, trying next metadata server", t.poolEntry.Server, id, addr.Desc(), err)
 		}
 
 		// All metadata servers failed - wait and retry
@@ -233,7 +233,7 @@ func (t *transportDoris) httpRoutine(id int) {
 
 			for tableName, request := range requests {
 				// Ensure table schema is prepared
-				if t.prepareTableSchema(tableName) {
+				if t.prepareTableSchema(id, tableName) {
 					// Error during schema preparation or shutdown
 					return
 				}
