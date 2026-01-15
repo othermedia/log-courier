@@ -47,11 +47,11 @@ func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr 
 	// Initialize column definitions with hard-coded defaults
 	tm.columnDefs = map[string]string{
 		"@timestamp":             "datetime",
-		"type":                   "text",
-		"host":                   "text",
-		"path":                   "text",
+		"type":                   "varchar(255)",
+		"host":                   "varchar(255)",
+		"path":                   "varchar(5120)",
 		"offset":                 "bigint",
-		"tags":                   "array<text>",
+		"tags":                   "array<varchar(255)>",
 		"message":                "text",
 		tm.config.RestJSONColumn: "variant",
 	}
