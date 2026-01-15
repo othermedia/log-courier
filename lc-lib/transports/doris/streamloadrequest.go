@@ -20,8 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
-	"time"
 
 	"github.com/driskell/log-courier/lc-lib/event"
 )
@@ -79,12 +77,12 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 
 			// Single loop: map columns and collect unmapped fields
 			for key, value := range eventData {
-				if colType, isMapped := p.columnDefs[key]; isMapped {
+				if _, isMapped := p.columnDefs[key]; isMapped {
 					// Column is mapped - format and add to mappedEvent
 					if key != p.restJSONColumn {
-						mappedEvent[key] = p.formatValue(value, colType)
+						mappedEvent[key] = value
 					}
-				} else if key != "@timestamp" && key != "@metadata" {
+				} else if key != "@metadata" {
 					// Unmapped field - add to rest data (exclude @ prefixed metadata fields)
 					restData[key] = value
 				}
@@ -128,46 +126,4 @@ func (p *streamLoadRequest) Read(dst []byte) (n int, err error) {
 	}
 
 	return
-}
-
-// formatValue formats a value for Doris based on the column type
-func (p *streamLoadRequest) formatValue(value interface{}, colType string) interface{} {
-	// Handle event.Timestamp type regardless of column name
-	if ts, ok := value.(event.Timestamp); ok {
-		return time.Time(ts).Format("2006-01-02 15:04:05")
-	}
-
-	// Handle time.Time for DATETIME columns
-	if colType == "DATETIME" || colType == "DATE" {
-		if t, ok := value.(time.Time); ok {
-			if colType == "DATE" {
-				return t.Format("2006-01-02")
-			}
-			return t.Format("2006-01-02 15:04:05")
-		}
-	}
-
-	// Handle event.Tags type
-	if tags, ok := value.(event.Tags); ok {
-		return []string(tags)
-	}
-
-	// Handle ARRAY<STRING> columns
-	if strings.HasPrefix(colType, "ARRAY<STRING>") {
-		switch v := value.(type) {
-		case []string:
-			return v
-		case []interface{}:
-			result := make([]string, 0, len(v))
-			for _, item := range v {
-				if str, ok := item.(string); ok {
-					result = append(result, str)
-				}
-			}
-			return result
-		}
-	}
-
-	// For other types, return as-is and let Doris handle conversion
-	return value
 }
