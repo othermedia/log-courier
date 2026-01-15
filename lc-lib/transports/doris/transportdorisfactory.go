@@ -176,15 +176,14 @@ func (f *TransportDorisFactory) NewTransport(ctx context.Context, poolEntry *add
 	ctx, shutdownFunc := context.WithCancel(ctx)
 
 	ret := &transportDoris{
-		ctx:            ctx,
-		shutdownFunc:   shutdownFunc,
-		config:         f,
-		netConfig:      transports.FetchConfig(f.config),
-		poolEntry:      poolEntry,
-		eventChan:      eventChan,
-		clientCache:    make(map[string]*clientCacheItem),
-		preparedTables: make(map[string]bool),
-		tablePattern:   event.NewPatternFromString(f.TablePattern),
+		ctx:          ctx,
+		shutdownFunc: shutdownFunc,
+		config:       f,
+		netConfig:    transports.FetchConfig(f.config),
+		poolEntry:    poolEntry,
+		eventChan:    eventChan,
+		clientCache:  make(map[string]*clientCacheItem),
+		tablePattern: event.NewPatternFromString(f.TablePattern),
 	}
 
 	ret.startController()

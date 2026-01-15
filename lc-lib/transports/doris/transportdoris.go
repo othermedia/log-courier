@@ -64,13 +64,12 @@ type transportDoris struct {
 	eventChan    chan<- transports.Event
 
 	// Internal
-	payloadChan    chan *payload
-	payloadMutex   sync.Mutex
-	poolMutex      sync.Mutex
-	wait           sync.WaitGroup
-	tablePattern   event.Pattern
-	preparedTables map[string]bool
-	tableMgr       *tableManager
+	payloadChan  chan *payload
+	payloadMutex sync.Mutex
+	poolMutex    sync.Mutex
+	wait         sync.WaitGroup
+	tablePattern event.Pattern
+	tableMgr     map[string]*tableManager
 }
 
 // Factory returns the associated factory
@@ -95,7 +94,7 @@ func (t *transportDoris) controllerRoutine() {
 	}()
 
 	// Create single table manager instance
-	t.tableMgr = newTableManager(t.config)
+	t.tableMgr = make(map[string]*tableManager)
 
 	// Setup payload chan with max write count of pending payloads
 	t.payloadMutex.Lock()
@@ -120,12 +119,12 @@ func (t *transportDoris) controllerRoutine() {
 
 // prepareTableSchema prepares the table schema by connecting to metadata servers
 // and creating or validating the table
-func (t *transportDoris) prepareTableSchema(id int, table string) bool {
-	if _, ok := t.preparedTables[table]; ok {
-		// Already prepared
-		return false
+func (t *transportDoris) prepareTableSchema(id int, table string) (map[string]string, bool) {
+	if tableMgr, ok := t.tableMgr[table]; ok {
+		return tableMgr.ColumnDefs(), false
 	}
-	t.preparedTables[table] = true
+	tableMgr := newTableManager(t.config, table)
+	t.tableMgr[table] = tableMgr
 
 	defer tableSchemaLock.Unlock()
 	tableSchemaLock.Lock()
@@ -136,7 +135,7 @@ func (t *transportDoris) prepareTableSchema(id int, table string) bool {
 	metadataEntries, err := addresspool.GeneratePool(t.config.MetadataServers, t.netConfig.Rfc2782Srv, t.netConfig.Rfc2782Service, time.Second*60)
 	if err != nil {
 		log.Errorf("[T %s] Metadata server lookup failure: %s", t.poolEntry.Server, err)
-		return true
+		return nil, true
 	}
 
 MetadataConnectLoop:
@@ -145,10 +144,10 @@ MetadataConnectLoop:
 			addr, err := metadataEntry.Next()
 			if err != nil {
 				log.Errorf("[T %s] Metadata server lookup failure: %s", t.poolEntry.Server, err)
-				return true
+				return nil, true
 			}
 
-			connected, err := t.tableMgr.InitializeSchema(t.poolEntry, addr, table)
+			connected, err := tableMgr.InitializeSchema(t.poolEntry, addr)
 			if err == nil {
 				// Success
 				break MetadataConnectLoop
@@ -158,7 +157,7 @@ MetadataConnectLoop:
 			if connected {
 				// Connected but schema operation failed - fatal error
 				log.Errorf("[T %s]{%d}{%s} Failed to initialize Doris table schema: %s", t.poolEntry.Server, id, addr.Desc(), err)
-				return true
+				return nil, true
 			}
 
 			// Connection error - try next server
@@ -168,11 +167,11 @@ MetadataConnectLoop:
 		// All metadata servers failed - wait and retry
 		if t.retryWait(backoff) {
 			// Shutdown requested during retry
-			return true
+			return nil, true
 		}
 	}
 
-	return false
+	return tableMgr.ColumnDefs(), false
 }
 
 // httpRoutine performs stream load requests to Doris
@@ -204,9 +203,13 @@ func (t *transportDoris) httpRoutine(id int) {
 			// one per table name
 			var requests map[string]*streamLoadRequest
 			if t.tablePattern.IsStatic() {
+				columnDefs, shutdown := t.prepareTableSchema(id, t.tablePattern.String())
+				if shutdown {
+					return
+				}
 				// Use static allocation to avoid heap allocation
 				requests = map[string]*streamLoadRequest{
-					t.config.TablePattern: newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, payload.events),
+					t.config.TablePattern: newStreamLoadRequest(columnDefs, t.config.RestJSONColumn, payload.events),
 				}
 			} else {
 				var eventsByTable map[string][]*event.Event
@@ -227,17 +230,15 @@ func (t *transportDoris) httpRoutine(id int) {
 				}
 				requests = make(map[string]*streamLoadRequest)
 				for tableName, events := range eventsByTable {
-					requests[tableName] = newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, events)
+					columnDefs, shutdown := t.prepareTableSchema(id, tableName)
+					if shutdown {
+						return
+					}
+					requests[tableName] = newStreamLoadRequest(columnDefs, t.config.RestJSONColumn, events)
 				}
 			}
 
 			for tableName, request := range requests {
-				// Ensure table schema is prepared
-				if t.prepareTableSchema(id, tableName) {
-					// Error during schema preparation or shutdown
-					return
-				}
-
 				// Retry until successful or shutdown
 				for {
 					t.poolMutex.Lock()
@@ -312,7 +313,7 @@ func (t *transportDoris) performStreamLoad(addr *addresspool.Address, id int, ta
 	}
 
 	if response.Status != "Success" && response.Status != "Publish Timeout" {
-		return fmt.Errorf("stream load failed with status: %s [Message: %s] [Comment: %s] [FirstErrorMessage: %s]", response.Status, response.Message, response.Comment, response.FirstErrorMessage)
+		return fmt.Errorf("stream load failed with status: %s [Message: %s] [Comment: %s] [FirstErrorMessage: %s] [ErrorURL: %s]", response.Status, response.Message, response.Comment, response.FirstErrorMessage, response.ErrorURL)
 	}
 
 	log.Debugf("[T %s]{%d} Doris stream load complete (txnid: %d; label: %s; loaded %d; filtered %d; time %dms)", addr.Desc(), id, response.TxnID, response.Label, response.NumberLoadedRows, response.NumberFilteredRows, response.LoadTimeMs)

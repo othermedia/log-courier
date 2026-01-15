@@ -30,20 +30,22 @@ import (
 // tableManager handles Doris table creation and column management
 type tableManager struct {
 	config     *TransportDorisFactory
+	table      string
 	columnDefs map[string]string
 	indexDefs  []string
 }
 
 // newTableManager creates a new table manager instance
-func newTableManager(config *TransportDorisFactory) *tableManager {
+func newTableManager(config *TransportDorisFactory, table string) *tableManager {
 	return &tableManager{
 		config: config,
+		table:  table,
 	}
 }
 
 // InitializeSchema initializes column definitions and ensures the table exists with necessary columns
 // Returns (connected, error) where connected indicates if SQL connection was successful
-func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string) (bool, error) {
+func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr *addresspool.Address) (bool, error) {
 	// Initialize column definitions with hard-coded defaults
 	tm.columnDefs = map[string]string{
 		"@timestamp":             "datetime",
@@ -75,16 +77,16 @@ func (tm *tableManager) InitializeSchema(poolEntry *addresspool.PoolEntry, addr 
 	defer db.Close()
 
 	// Check if table exists using DESCRIBE
-	describeSQL := fmt.Sprintf("DESCRIBE `%s`.`%s`", tm.config.Database, table)
+	describeSQL := fmt.Sprintf("DESCRIBE `%s`.`%s`", tm.config.Database, tm.table)
 	rows, err := db.Query(describeSQL)
 	if err != nil {
 		// Table likely doesn't exist - create it
-		return true, tm.createTable(poolEntry, addr, table, db)
+		return true, tm.createTable(poolEntry, addr, db)
 	}
 	defer rows.Close()
 
 	// Table exists - check columns
-	return true, tm.validateAndUpdateColumns(poolEntry, addr, table, db, rows)
+	return true, tm.validateAndUpdateColumns(poolEntry, addr, db, rows)
 }
 
 // ColumnDefs returns the column definitions
@@ -126,8 +128,8 @@ func (tm *tableManager) connectSQL(poolEntry *addresspool.PoolEntry, addr *addre
 }
 
 // validateAndUpdateColumns validates existing columns and adds missing ones
-func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string, db *sql.DB, rows *sql.Rows) error {
-	log.Infof("[T %s]{%s} Validating existing table schema for %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, table)
+func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, db *sql.DB, rows *sql.Rows) error {
+	log.Infof("[T %s]{%s} Validating existing table schema for %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, tm.table)
 	// Parse DESCRIBE result to get existing columns
 	existingCols := make(map[string]string)
 
@@ -191,29 +193,29 @@ func (tm *tableManager) validateAndUpdateColumns(poolEntry *addresspool.PoolEntr
 	}
 
 	if len(missingCols) == 0 {
-		log.Infof("[T %s]{%s} Doris table %s.%s schema is valid", poolEntry.Server, addr.Desc(), tm.config.Database, table)
+		log.Infof("[T %s]{%s} Doris table %s.%s schema is valid", poolEntry.Server, addr.Desc(), tm.config.Database, tm.table)
 		return nil
 	}
 
 	// Add missing columns
 	for _, colName := range missingCols {
 		colType := tm.columnDefs[colName]
-		alterSQL := fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `%s` %s", tm.config.Database, table, colName, colType)
+		alterSQL := fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `%s` %s", tm.config.Database, tm.table, colName, colType)
 
 		_, err := db.Exec(alterSQL)
 		if err != nil {
 			return fmt.Errorf("failed to add column '%s': %s", colName, err)
 		}
 
-		log.Infof("[T %s]{%s} Added column '%s' to table %s.%s", poolEntry.Server, addr.Desc(), colName, tm.config.Database, table)
+		log.Infof("[T %s]{%s} Added column '%s' to table %s.%s", poolEntry.Server, addr.Desc(), colName, tm.config.Database, tm.table)
 	}
 
 	return nil
 }
 
 // createTable creates a new table with proper schema and partitioning
-func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, table string, db *sql.DB) error {
-	log.Infof("[T %s]{%s} Creating new table %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, table)
+func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addresspool.Address, db *sql.DB) error {
+	log.Infof("[T %s]{%s} Creating new table %s.%s", poolEntry.Server, addr.Desc(), tm.config.Database, tm.table)
 
 	columnDefs := make([]string, 0, len(tm.columnDefs))
 	for colName, colType := range tm.columnDefs {
@@ -255,7 +257,7 @@ func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addr
 			"DISTRIBUTED BY HASH(`type`) BUCKETS 10 "+
 			"PROPERTIES (%s)",
 		tm.config.Database,
-		table,
+		tm.table,
 		strings.Join(columnDefs, ", "),
 		strings.Join(tm.indexDefs, ", "),
 		strings.Join(properties, ", "),
@@ -266,7 +268,7 @@ func (tm *tableManager) createTable(poolEntry *addresspool.PoolEntry, addr *addr
 		return fmt.Errorf("failed to create table: %s", err)
 	}
 
-	log.Infof("[T %s]{%s} Created Doris table %s.%s with %d-day retention", poolEntry.Server, addr.Desc(), tm.config.Database, table, tm.config.PartitionRetentionDays)
+	log.Infof("[T %s]{%s} Created Doris table %s.%s with %d-day retention", poolEntry.Server, addr.Desc(), tm.config.Database, tm.table, tm.config.PartitionRetentionDays)
 	return nil
 }
 
