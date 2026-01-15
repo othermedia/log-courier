@@ -94,6 +94,9 @@ func (t *transportDoris) controllerRoutine() {
 		t.eventChan <- transports.NewStatusEvent(t.ctx, transports.Finished, nil)
 	}()
 
+	// Create single table manager instance
+	t.tableMgr = newTableManager(t.config)
+
 	// Setup payload chan with max write count of pending payloads
 	t.payloadMutex.Lock()
 	t.payloadChan = make(chan *payload, t.netConfig.MaxPendingPayloads)
@@ -129,9 +132,6 @@ func (t *transportDoris) prepareTableSchema(table string) bool {
 
 	backoffName := fmt.Sprintf("[T %s] Setup Retry", t.poolEntry.Server)
 	backoff := core.NewExpBackoff(backoffName, t.config.Retry, t.config.RetryMax)
-
-	// Create single table manager instance
-	t.tableMgr = newTableManager(t.config)
 
 	metadataEntries, err := addresspool.GeneratePool(t.config.MetadataServers, t.netConfig.Rfc2782Srv, t.netConfig.Rfc2782Service, time.Second*60)
 	if err != nil {
@@ -196,31 +196,40 @@ func (t *transportDoris) httpRoutine(id int) {
 				return
 			}
 
+			eventCount := uint32(len(payload.events))
+
 			// If using a static pattern, simplify the requests we need to send
+			// statically and quickly
 			// Otherwise if a pattern, we need to calculate multiple stream loads,
 			// one per table name
 			var requests map[string]*streamLoadRequest
 			if t.tablePattern.IsStatic() {
+				// Use static allocation to avoid heap allocation
 				requests = map[string]*streamLoadRequest{
 					t.config.TablePattern: newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, payload.events),
 				}
 			} else {
-				eventsByTable := make(map[string][]*event.Event)
-				for _, ev := range payload.events {
-					tableName, err := t.tablePattern.Format(ev)
-					if err != nil {
-						log.Errorf("[T %s]{%d} Failed to determine table name for event: %s", t.poolEntry.Server, id, err)
-						continue
+				var eventsByTable map[string][]*event.Event
+				if t.tablePattern.IsStatic() {
+					eventsByTable = map[string][]*event.Event{
+						t.config.TablePattern: payload.events,
 					}
-					eventsByTable[tableName] = append(eventsByTable[tableName], ev)
+				} else {
+					eventsByTable = make(map[string][]*event.Event)
+					for _, ev := range payload.events {
+						tableName, err := t.tablePattern.Format(ev)
+						if err != nil {
+							log.Errorf("[T %s]{%d} Failed to determine table name for event: %s", t.poolEntry.Server, id, err)
+							continue
+						}
+						eventsByTable[tableName] = append(eventsByTable[tableName], ev)
+					}
 				}
 				requests = make(map[string]*streamLoadRequest)
 				for tableName, events := range eventsByTable {
 					requests[tableName] = newStreamLoadRequest(t.tableMgr.ColumnDefs(), t.config.RestJSONColumn, events)
 				}
 			}
-
-			eventCount := uint32(len(payload.events))
 
 			for tableName, request := range requests {
 				// Ensure table schema is prepared
@@ -234,11 +243,9 @@ func (t *transportDoris) httpRoutine(id int) {
 					t.poolMutex.Lock()
 					addr, err := t.poolEntry.Next()
 					t.poolMutex.Unlock()
-
 					if err == nil {
 						err = t.performStreamLoad(addr, id, tableName, request, payload.nonce)
 					}
-
 					if err == nil {
 						select {
 						case <-t.ctx.Done():
@@ -248,7 +255,6 @@ func (t *transportDoris) httpRoutine(id int) {
 						}
 						break
 					}
-
 					log.Errorf("[T %s]{%d} Doris stream load failed: %s", addr.Desc(), id, err)
 
 					if t.retryWait(backoff) {
